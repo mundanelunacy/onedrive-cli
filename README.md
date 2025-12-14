@@ -69,20 +69,31 @@ This little utility supports the following commands:
 
 `onedrive find 'Pictures/Camera Roll' -regex 2015 -type f -print0 | xargs -0 onedrive mv -t :/Pictures/2015/`
 
+## Using Your Own Azure App (custom client_id / redirect)
+
+You can supply your own Microsoft Entra (Azure AD) app registration instead of the default:
+
+-   Create a new app in Azure Portal → Microsoft Entra ID → App registrations → New registration.
+-   Choose “Personal Microsoft accounts only”, add a Web redirect URI that matches your hosted callback page (for example your deployed `oauthcallbackhandler.html`), and save.
+-   API permissions: add delegated permissions `offline_access` and `Files.ReadWrite`, then grant consent if available.
+-   No client secret is required for this public/PKCE flow.
+-   Set `CLIENT_ID` in `bin/onedrive` to your app’s Application (client) ID, and set `ONEDRIVE_REDIRECT_URI` to your hosted callback URL (or hard-code it in `bin/onedrive`).
+-   If you host the callback yourself, deploy `docs/oauthcallbackhandler.html` (see `hosting/public/oauthcallbackhandler.html` for a Firebase example) and point `ONEDRIVE_REDIRECT_URI` at that URL.
+-   Re-run `onedrive login` to generate a new PKCE login URL, then complete the flow to store fresh tokens.
+
 ## FAQ
 
 ##### Access token was not found; 'login' first.
 
 The `onedrive` utility needs an access token in order to read/write to your OneDrive storage.
 Use the`onedrive login` command to get the address of the Microsoft login page. After login,
-this page will redirect to the file `oauthcallbackhandler.html` (https://github.com/lionello/onedrive-cli/blob/master/docs/oauthcallbackhandler.html)
+this page will redirect to the file `oauthcallbackhandler.html` (https://github.com/mundanelunacy/onedrive-cli/blob/master/docs/oauthcallbackhandler.html)
 and extract the authorization `code` from the URL parameters. Copy-paste this code into the command line
 using `onedrive login code <AUTHORIZATION_CODE>`.
 This will save the access token and refresh token in a file called `~/.onedrive-cli-token`.
 Tokens are refreshed automatically about every 30 minutes while the tool is running so long operations stay authenticated.
 The `onedrive login` command generates the PKCE code challenge/verifier for you; run it to get the URL, then use the resulting `login code ...` command in the same environment so the verifier can be redeemed.
-To host the callback handler yourself, set `ONEDRIVE_REDIRECT_URI` to your hosted callback URL before running `onedrive login`; the authorization URL and token exchange will both use this value.
-When using your own Azure app registration, grant delegated permissions `offline_access` and `onedrive.readwrite` and ensure the redirect URI matches `ONEDRIVE_REDIRECT_URI`; then re-run `onedrive login` to obtain fresh tokens.
+For custom clients and redirects, follow the “Using Your Own Azure App” section above.
 
 ##### "An item with the same name already exists under the parent"
 
