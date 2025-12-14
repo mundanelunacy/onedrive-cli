@@ -9,6 +9,19 @@ const Moment = require('moment')
 const Path = require('path')
 const Zlib = require('zlib')
 
+// const CLIENT_ID = '0000000040197E82'
+const CLIENT_ID = 'de021627-a2a1-48a4-b5c1-9d12ff1c8208'
+const REDIRECT_URI =
+    process.env.ONEDRIVE_REDIRECT_URI ||
+    'https://onedrive-cli-b85b9.web.app/oauthcallbackhandler.html'
+// 'https://www.lunesu.com/onedrive-cli/oauthcallbackhandler.html'
+const TOKEN_ENDPOINT = 'https://login.live.com/oauth20_token.srf'
+const TOKEN_REFRESH_THRESHOLD_MS = 1000 * 60 * 30 // Refresh when <= 30 mins remain
+const PKCE_VERIFIER_PATH = Path.join(
+    process.env.XDG_STATE_HOME || require('os').homedir(),
+    '.onedrive-cli-pkce'
+)
+
 // The $XDG_STATE_HOME directory contains state data that should persist between (application) restarts.
 const TOKEN_PATH = Path.join(
     process.env.XDG_STATE_HOME || require('os').homedir(),
@@ -82,18 +95,125 @@ function prettyPrint(num) {
     return padLeft(humanize(num), 6)
 }
 
-var lazyToken = async function () {
-    const buffer = await FS.readFile(TOKEN_PATH)
-    const token = Promise.resolve(buffer.toString())
-    // Next time we're invoked, simply return the resolved promise
-    lazyToken = function () {
-        return token
+function base64url(buffer) {
+    return buffer
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '')
+}
+
+async function createPkcePair() {
+    const verifier = base64url(Crypto.randomBytes(64))
+    const challenge = base64url(
+        Crypto.createHash('sha256').update(verifier).digest()
+    )
+    await FS.writeFile(PKCE_VERIFIER_PATH, verifier)
+    return { verifier, challenge }
+}
+
+async function readPkceVerifier() {
+    const verifier = await FS.readFile(PKCE_VERIFIER_PATH, 'utf8')
+    return verifier.trim()
+}
+
+async function readTokenFromDisk() {
+    const buffer = await FS.readFile(TOKEN_PATH, 'utf8')
+    try {
+        const parsed = JSON.parse(buffer)
+        if (typeof parsed === 'string') {
+            return { access_token: parsed }
+        }
+        if (parsed.expires_on && !parsed.expires_at) {
+            parsed.expires_at = Number(parsed.expires_on) * 1000
+        }
+        return parsed
+    } catch (err) {
+        return { access_token: buffer.toString() }
     }
-    return token
+}
+
+function withExpiresAt(tokenResponse) {
+    const expiresIn = Number(tokenResponse.expires_in)
+    const expires_at = Number.isFinite(expiresIn)
+        ? Date.now() + (expiresIn - 60) * 1000 // pad 60s to avoid race
+        : tokenResponse.expires_at
+    return { ...tokenResponse, expires_at }
+}
+
+async function storeTokens(tokens) {
+    const normalized = withExpiresAt(tokens)
+    await FS.writeFile(TOKEN_PATH, JSON.stringify(normalized, null, 2))
+    return normalized
+}
+
+async function requestToken(params) {
+    const body = new URLSearchParams({
+        client_id: CLIENT_ID,
+        redirect_uri: REDIRECT_URI,
+        ...params,
+    })
+    const resp = await fetch(TOKEN_ENDPOINT, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body,
+    })
+    const json = await resp.json()
+    if (!resp.ok) {
+        const msg = json.error_description || json.error || resp.statusText
+        throw Error(msg)
+    }
+    return json
+}
+
+let cachedTokenPromise
+
+async function refreshToken(refresh_token) {
+    console.log('Refreshing access token...')
+    const response = await requestToken({
+        grant_type: 'refresh_token',
+        refresh_token,
+    })
+    console.log('Access token refreshed.')
+
+    return storeTokens({
+        access_token: response.access_token,
+        refresh_token: response.refresh_token || refresh_token,
+        scope: response.scope,
+        token_type: response.token_type,
+        expires_in: response.expires_in,
+    })
+}
+
+function shouldRefresh(token) {
+    if (!token.refresh_token) {
+        return false
+    }
+    if (!token.expires_at) {
+        return true
+    }
+    return token.expires_at - TOKEN_REFRESH_THRESHOLD_MS <= Date.now()
+}
+
+async function loadToken() {
+    if (!cachedTokenPromise) {
+        cachedTokenPromise = readTokenFromDisk()
+    }
+    let token = await cachedTokenPromise
+    if (shouldRefresh(token)) {
+        cachedTokenPromise = refreshToken(token.refresh_token)
+        token = await cachedTokenPromise
+    }
+    if (!token.access_token) {
+        throw Error('Access token was not found; run `onedrive login` first.')
+    }
+    return token.access_token
 }
 
 async function call(url, method, body, headers = {}) {
-    const token = await lazyToken()
+    const token = await loadToken()
     const options = {
         agent: httpsAgent,
         body: body,
@@ -127,7 +247,7 @@ async function getContent(url) {
         console.warn(Colors.yellow('GET'), decodeURIComponent(url))
     }
 
-    const token = await lazyToken()
+    const token = await loadToken()
     const resp = await fetch(makeAbsolute(url), {
         agent: httpsAgent,
         headers: {
@@ -547,24 +667,80 @@ async function cat(args) {
     }
 }
 
-function loginUrl() {
+function loginUrl(codeChallenge) {
+    const params = new URLSearchParams({
+        client_id: CLIENT_ID,
+        scope: 'offline_access onedrive.readwrite',
+        response_type: 'code',
+        redirect_uri: REDIRECT_URI,
+    })
+    if (codeChallenge) {
+        params.set('code_challenge', codeChallenge)
+        params.set('code_challenge_method', 'S256')
+    }
     console.log(
         '\nBrowse to',
         Colors.underline(
-            'https://login.live.com/oauth20_authorize.srf?client_id=0000000040197E82&scope=onedrive.readwrite&response_type=token&redirect_uri=https%3A%2F%2Fwww.lunesu.com%2Fonedrive-cli%2Foauthcallbackhandler.html'
+            `https://login.live.com/oauth20_authorize.srf?${params.toString()}`
         )
     )
 }
 
-async function login(args) {
-    const token = args.pop()
-    if (typeof token === 'string') {
-        await FS.writeFile(TOKEN_PATH, token)
-        return 'Access token was saved to ' + TOKEN_PATH
-    } else {
-        console.error('usage: login access_token')
+async function printLoginUrlWithPkce() {
+    try {
+        const { challenge } = await createPkcePair()
+        loginUrl(challenge)
+    } catch (err) {
+        console.error(
+            Colors.red('Failed to generate PKCE verifier: ' + err.message)
+        )
         loginUrl()
     }
+}
+
+async function login(args) {
+    if (args.length === 0) {
+        return printLoginUrlWithPkce()
+    }
+
+    if (args.length === 2 && args[0] === 'code') {
+        const code = args[1]
+        let code_verifier
+        try {
+            code_verifier = await readPkceVerifier()
+        } catch (err) {
+            throw Error(
+                'PKCE verifier not found; run `onedrive login` to generate a login URL first.'
+            )
+        }
+        const token = await requestToken({
+            grant_type: 'authorization_code',
+            code,
+            code_verifier,
+        })
+        await storeTokens({
+            access_token: token.access_token,
+            refresh_token: token.refresh_token,
+            scope: token.scope,
+            token_type: token.token_type,
+            expires_in: token.expires_in,
+        })
+        try {
+            await FS.unlink(PKCE_VERIFIER_PATH)
+        } catch (err) {
+            debugPrint('PKCE cleanup failed:', err.message)
+        }
+        return 'Access and refresh tokens were saved to ' + TOKEN_PATH
+    }
+
+    const token = args.pop()
+    if (typeof token === 'string') {
+        await storeTokens({ access_token: token })
+        return 'Access token was saved to ' + TOKEN_PATH
+    }
+
+    console.error('usage: login [code AUTHORIZATION_CODE] | login access_token')
+    return printLoginUrlWithPkce()
 }
 
 async function ln(args) {
@@ -841,12 +1017,12 @@ main(process.argv).then(
             console.log(Colors.green(result))
         }
     },
-    err => {
+    async err => {
         console.error(Colors.red(err.localizedMessage || err.message))
         debugPrint(err)
         // Special error handling case for fatal login failures
         if (err.statusCode === 401 || err.path === TOKEN_PATH) {
-            loginUrl()
+            await printLoginUrlWithPkce()
             // Exit with -1 to ensure xargs stops invoking us
             process.exitCode = -1
         } else {
